@@ -25,8 +25,10 @@ class PostForm(forms.ModelForm):
 
     class Meta:
         model = Post
-        fields = ('title', 'text', 'pub_date', 'is_published', 'category',
-                  'image')
+        fields = (
+            'title', 'text', 'pub_date', 'is_published',
+            'author', 'category', 'location', 'image'
+        )
         widgets = {
             'pub_date': forms.DateInput(
                 attrs={'type': 'date'},

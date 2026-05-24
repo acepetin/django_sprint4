@@ -1,5 +1,6 @@
 from django.contrib.auth.mixins import LoginRequiredMixin
-from django.db.models import Count
+from django.db.models import Count, Q
+from django.core.paginator import Paginator
 from django.shortcuts import get_object_or_404
 from django.urls import reverse
 from django.utils import timezone
@@ -23,22 +24,28 @@ from .models import Category, Post, User
 PAGINATE_BY = 10
 
 
-def process_posts(posts=Post.objects.all(), apply_filters=True,
-                  use_select_related=True,
-                  apply_annotation=True):
-    """Фильтрация, аннотирование и сортировка постов."""
-    if apply_filters:
-        posts = posts.filter(
-            is_published=True,
-            category__is_published=True,
-            pub_date__lte=timezone.now()
-        )
-    if use_select_related:
-        posts = posts.select_related('category', 'location', 'author')
-    if apply_annotation:
-        posts = posts.annotate(
-            comment_count=Count('comments')).order_by(*Post._meta.ordering)
-    return posts
+def get_published_posts(queryset):
+    """Фильтрация только опубликованных постов."""
+    return queryset.filter(
+        is_published=True,
+        pub_date__lte=timezone.now()
+    ).filter(
+        Q(category__isnull=True) | Q(category__is_published=True)
+    )
+
+
+def annotate_comment_count(queryset):
+    """Аннотация количества комментариев и сортировка."""
+    return queryset.annotate(
+        comment_count=Count('comments')
+    ).order_by(*Post._meta.ordering)
+
+
+def paginate_posts(request, queryset, per_page):
+    """Пагинация."""
+    paginator = Paginator(queryset, per_page)
+    page_number = request.GET.get('page')
+    return paginator.get_page(page_number)
 
 
 class PostListView(ListView):
@@ -47,8 +54,16 @@ class PostListView(ListView):
     model = Post
     template_name = 'blog/index.html'
     context_object_name = 'post_list'
-    paginate_by = PAGINATE_BY
-    queryset = process_posts()
+    
+    def get_queryset(self):
+        qs = Post.objects.select_related('category', 'location', 'author')
+        qs = get_published_posts(qs)
+        return annotate_comment_count(qs)
+    
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        context['page_obj'] = paginate_posts(self.request, self.get_queryset(), PAGINATE_BY)
+        return context
 
 
 class CategoryPostsView(ListView):
@@ -65,7 +80,17 @@ class CategoryPostsView(ListView):
         )
 
     def get_queryset(self):
-        return process_posts(self.get_category().posts.all())
+        qs = self.get_category().posts.select_related(
+            'category', 'location', 'author'
+        )
+        qs = get_published_posts(qs)
+        return annotate_comment_count(qs)
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        context['category'] = self.get_category()
+        context['page_obj'] = paginate_posts(self.request, self.get_queryset(), PAGINATE_BY)
+        return context
 
 
 class PostDetailView(BasePostMixin, DetailView):
@@ -78,16 +103,14 @@ class PostDetailView(BasePostMixin, DetailView):
         post = super().get_object()
         if self.request.user == post.author:
             return post
-        return super().get_object(process_posts(
-            use_select_related=False,
-            apply_annotation=False
-        ))
+        qs = get_published_posts(Post.objects.all())
+        return get_object_or_404(qs, pk=self.kwargs.get(self.pk_url_kwarg))
 
     def get_context_data(self, **kwargs):
         return super().get_context_data(
             **kwargs,
             form=CommentForm(),
-            comments=self.get_object().comments.all()
+            comments=self.get_object().comments.select_related('author')
         )
 
 
@@ -120,29 +143,37 @@ class PostUpdateView(BasePostMixin, OwnerRequiredMixin, UpdateView):
 class PostDeleteView(BasePostMixin, LoginRequiredMixin,
                      OwnerRequiredMixin, DeleteView):
     """Удаление поста."""
+    template_name = 'blog/post_confirm_delete.html'
+
+    def get_success_url(self):
+        return reverse('blog:profile', args=[self.request.user.username])
 
 
 class ProfileView(ListView):
     """Профиль пользователя."""
 
     template_name = 'blog/profile.html'
-    paginate_by = PAGINATE_BY
 
     def get_author(self):
         return get_object_or_404(User, username=self.kwargs['username'])
 
     def get_queryset(self):
         author = self.get_author()
-        return process_posts(
-            author.posts.all(),
-            apply_filters=self.request.user != author)
+        qs = author.posts.select_related('category', 'location', 'author')
+
+        if self.request.user != author:
+            qs = get_published_posts(qs)
+
+        return annotate_comment_count(qs)
 
     def get_context_data(self, **kwargs):
-        return super().get_context_data(
-            **kwargs,
-            profile=self.get_author(),
-            is_owner=self.request.user == self.get_author()
+        context = super().get_context_data(**kwargs)
+        context['profile'] = self.get_author()
+        context['is_owner'] = self.request.user == self.get_author()
+        context['page_obj'] = paginate_posts(
+            self.request, self.get_queryset(), PAGINATE_BY
         )
+        return context
 
 
 class ProfileEditView(LoginRequiredMixin, UpdateView):
@@ -176,3 +207,4 @@ class CommentUpdateView(CommentBaseMixin, OwnerRequiredMixin,
 class CommentDeleteView(LoginRequiredMixin, OwnerRequiredMixin,
                         CommentObjectMixin, DeleteView):
     """Удаление комментария."""
+    template_name = 'blog/comment_confirm_delete.html'
